@@ -196,6 +196,7 @@ func (r *run) run(ctx gocontext.Context, targets []string) error {
 			return err
 		}
 	}
+
 	if ui.IsCI && !r.opts.runOpts.noDaemon {
 		r.base.Logger.Info("skipping turbod since we appear to be in a non-interactive context")
 	} else if !r.opts.runOpts.noDaemon {
@@ -282,7 +283,8 @@ func (r *run) runOperation(ctx gocontext.Context, g *graph.CompleteGraph, rs *ru
 		vertexSet.Add(v)
 	}
 
-	engine, err := buildTaskGraphEngine(&g.TopologicalGraph, g.Pipeline, rs)
+	engine, err := buildTaskGraphEngine(g, rs)
+
 	if err != nil {
 		return errors.Wrap(err, "error preparing engine")
 	}
@@ -301,7 +303,7 @@ func (r *run) runOperation(ctx gocontext.Context, g *graph.CompleteGraph, rs *ru
 				g.TopologicalGraph.RemoveEdge(edge)
 			}
 		}
-		engine, err = buildTaskGraphEngine(&g.TopologicalGraph, g.Pipeline, rs)
+		engine, err = buildTaskGraphEngine(g, rs)
 		if err != nil {
 			return errors.Wrap(err, "error preparing engine")
 		}
@@ -354,6 +356,7 @@ func (r *run) runOperation(ctx gocontext.Context, g *graph.CompleteGraph, rs *ru
 			r.base.UI.Output(fmt.Sprintf(ui.Dim("• Packages in scope: %v"), strings.Join(packagesInScope, ", ")))
 			r.base.UI.Output(fmt.Sprintf("%s %s %s", ui.Dim("• Running"), ui.Dim(ui.Bold(strings.Join(rs.Targets, ", "))), ui.Dim(fmt.Sprintf("in %v packages", rs.FilteredPkgs.Len()))))
 		}
+
 		return r.executeTasks(ctx, g, rs, engine, packageManager, tracker, startAt)
 	}
 	return nil
@@ -464,46 +467,116 @@ func filterSinglePackageGraphForDisplay(originalGraph *dag.AcyclicGraph) *dag.Ac
 	return graph
 }
 
-func buildTaskGraphEngine(topoGraph *dag.AcyclicGraph, pipeline fs.Pipeline, rs *runSpec) (*core.Engine, error) {
-	engine := core.NewEngine(topoGraph)
+func buildTaskGraphEngine(g *graph.CompleteGraph, rs *runSpec) (*core.Engine, error) {
+	engine := core.NewEngine(&g.TopologicalGraph)
 
-	for taskName, taskDefinition := range pipeline {
-		topoDeps := make(util.Set)
+	for taskName, taskDefinition := range g.Pipeline {
 		deps := make(util.Set)
+
 		isPackageTask := util.IsPackageTask(taskName)
+
 		for _, dependency := range taskDefinition.TaskDependencies {
-			if isPackageTask && util.IsPackageTask(dependency) {
-				err := engine.AddDep(dependency, taskName)
-				if err != nil {
+			depTaskIsPackageTask := util.IsPackageTask(dependency)
+			// If both tasks are package tasks, add the relationship to the engine.
+			// Otherwise, if it's a dependency like `dependsOn: ['whatever']`
+			// add the dependency to the task itself.
+			if isPackageTask && depTaskIsPackageTask {
+				if err := engine.AddDep(dependency, taskName); err != nil {
 					return nil, err
 				}
 			} else {
 				deps.Add(dependency)
 			}
 		}
-		for _, dependency := range taskDefinition.TopologicalDependencies {
-			topoDeps.Add(dependency)
-		}
+
 		engine.AddTask(&core.Task{
-			Name:     taskName,
-			TopoDeps: topoDeps,
-			Deps:     deps,
+			Name:       taskName,
+			TopoDeps:   util.SetFromStrings(taskDefinition.TopologicalDependencies),
+			Deps:       deps,
+			Persistent: taskDefinition.Persistent,
 		})
 	}
 
-	if err := engine.Prepare(&core.EngineBuildingOptions{
+	engineOptions := &core.EngineBuildingOptions{
 		Packages:  rs.FilteredPkgs.UnsafeListOfStrings(),
 		TaskNames: rs.Targets,
 		TasksOnly: rs.Opts.runOpts.only,
-	}); err != nil {
+	}
+
+	if err := engine.Prepare(engineOptions); err != nil {
 		return nil, err
 	}
 
+	// Check for cycles in the DAG.
 	if err := util.ValidateGraph(engine.TaskGraph); err != nil {
 		return nil, fmt.Errorf("Invalid task dependency graph:\n%v", err)
 	}
 
+	if err := engine.ValidatePersistentDependencies(g); err != nil {
+		return nil, fmt.Errorf("Invalid persistent task dependency: %v", err)
+	}
+
 	return engine, nil
+}
+
+// Check if the Task has persistent deps and if those deps are actually implemented
+func validatePersistentDependencies(engine *core.Engine, graph *graph.CompleteGraph) error {
+	var validationError error
+
+	// TODO: Check errors returned by TaskGraph.Walk(), to make sure it didn't fail for some reason.
+	engine.TaskGraph.Walk(func(v dag.Vertex) error {
+		vertexName := dag.VertexName(v) // vertextName is a taskID
+
+		// No need to check the root node if that's where we are.
+		if strings.Contains(vertexName, core.ROOT_NODE_NAME) {
+			return nil
+		}
+
+		currentPackageName, currentTaskName := util.GetPackageTaskFromId(vertexName)
+
+		// For each "downEdge" (i.e. each task that _this_ task dependsOn)
+		// check if the downEdge is a Persistent task, and if it actually has the script implemented
+		// in that package's package.json
+		for dep := range engine.TaskGraph.DownEdges(vertexName) {
+			depTaskID := dep.(string)
+			// No need to check the root node
+			if strings.Contains(depTaskID, core.ROOT_NODE_NAME) {
+				return nil
+			}
+
+			// Parse the taskID of this dependency task
+			packageName, taskName := util.GetPackageTaskFromId(depTaskID)
+
+			// Check if the taskDefinition is Persistent
+			taskDef, ok2 := engine.GetTaskDefinition(packageName, taskName, depTaskID)
+
+			if ok2 != nil {
+				return fmt.Errorf("Cannot find task definition for %v in package %v", depTaskID, packageName)
+			}
+
+			// Check if the script is implemented
+			pkg, ok := graph.PackageInfos[packageName]
+			if !ok {
+				return fmt.Errorf("Cannot find package %v", packageName)
+			}
+			_, hasScript := pkg.Scripts[taskName]
+
+			// If both conditions are true set a value and break out
+			if taskDef.Persistent && hasScript {
+				validationError = fmt.Errorf(
+					"\"%s\" is a persistent task, \"%s\" cannot depend on it",
+					util.GetTaskId(packageName, taskName),
+					util.GetTaskId(currentPackageName, currentTaskName),
+				)
+				break
+			}
+		}
+
+		return nil
+	})
+
+	// May or may not be set (could be nil)
+	return validationError
 }
 
 // Opts holds the current run operations configuration
@@ -771,15 +844,20 @@ func (r *run) executeTasks(ctx gocontext.Context, g *graph.CompleteGraph, rs *ru
 		Parallel:    rs.Opts.runOpts.parallel,
 		Concurrency: rs.Opts.runOpts.concurrency,
 	}
-	visitor := g.GetPackageTaskVisitor(ctx, func(ctx gocontext.Context, packageTask *nodes.PackageTask) error {
+
+	execFunc := func(ctx gocontext.Context, packageTask *nodes.PackageTask) error {
 		deps := engine.TaskGraph.DownEdges(packageTask.TaskID)
+		// deps here are passed in to calculate the task hash
 		return ec.exec(ctx, packageTask, deps)
-	})
-	errs := engine.Execute(visitor, execOpts)
+	}
+
+	visitorFn := g.GetPackageTaskVisitor(ctx, execFunc)
+	errs := engine.Execute(visitorFn, execOpts)
 
 	// Track if we saw any child with a non-zero exit code
 	exitCode := 0
 	exitCodeErr := &process.ChildExit{}
+
 	for _, err := range errs {
 		if errors.As(err, &exitCodeErr) {
 			if exitCodeErr.ExitCode > exitCode {
