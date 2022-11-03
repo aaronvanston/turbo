@@ -16,7 +16,7 @@ pub mod util;
 
 use std::{
     collections::{HashMap, HashSet},
-    fmt::{self, Display},
+    fmt::{self, Debug, Display, Formatter},
     fs::FileType,
     io::{self, ErrorKind},
     mem::take,
@@ -46,6 +46,7 @@ use turbo_tasks::{
     trace::TraceRawVcs,
     CompletionVc, Invalidator, ValueToString, ValueToStringVc,
 };
+use turbo_tasks_hash::hash_xxh3_hash64;
 use util::{join_path, normalize_path, sys_to_unix, unix_to_sys};
 
 #[cfg(target_family = "windows")]
@@ -284,8 +285,8 @@ impl DiskFileSystemVc {
     }
 }
 
-impl fmt::Debug for DiskFileSystem {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+impl Debug for DiskFileSystem {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(f, "name: {}, root: {}", self.name, self.root)
     }
 }
@@ -866,7 +867,7 @@ impl FileSystemPathVc {
 }
 
 impl Display for FileSystemPath {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.path)
     }
 }
@@ -1135,7 +1136,7 @@ impl From<std::fs::Permissions> for Permissions {
 }
 
 #[turbo_tasks::value(shared)]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum FileContent {
     Content(File),
     NotFound,
@@ -1227,6 +1228,15 @@ impl File {
     /// Returns a Read/AsyncRead/Stream/Iterator to access the File's contents.
     pub fn read(&self) -> RopeReader {
         self.content.read()
+    }
+}
+
+impl Debug for File {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("File")
+            .field("meta", &self.meta)
+            .field("content (hash)", &hash_xxh3_hash64(self.content.as_slice()))
+            .finish()
     }
 }
 
